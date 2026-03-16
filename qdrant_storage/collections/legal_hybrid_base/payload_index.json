@@ -1,0 +1,1 @@
+{"schema":{"text":{"type":"text","tokenizer":"word","min_token_len":1,"lowercase":true}}}
