@@ -1,82 +1,77 @@
-import re
-from qdrant_client import QdrantClient, models
-import config
-from core.models import model, reranker
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Инициализация клиента Qdrant
-client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
+from qdrant_client import QdrantClient
+from app.config import (
+    QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME,
+    DENSE_MODEL, SPARSE_MODEL,
+    FETCH_LIMIT, FINAL_LIMIT
+)
 
-def ultimate_hybrid_search(query_text, fetch_limit=config.FETCH_LIMIT, final_limit=config.FINAL_LIMIT):
-    # 1 Генерация эмбеддингов (плотных и разреженных)
-    output = model.encode(query_text, return_dense=True, return_sparse=True, return_colbert_vecs=False)
-    dense_vec = output['dense_vecs'].tolist()
-    
-    unique_tokens = {}
-    for token_str, weight in output['lexical_weights'].items():
-        token_id = model.tokenizer.convert_tokens_to_ids(token_str)
-        if token_id is not None:
-            unique_tokens[token_id] = max(unique_tokens.get(token_id, 0), float(weight))
-            
-    query_sparse = models.SparseVector(
-        indices=list(unique_tokens.keys()), 
-        values=list(unique_tokens.values())
-    )
+# NO_PROXY нужен чтобы Python-клиент не шёл через системный прокси на localhost
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
-    # 2 Поиск точных 
-    exact_terms = re.findall(r'\b\d+(?:-\d+)*\b|[А-Яа-яA-Za-z]+-\d+(?:-\d+)*', query_text)
-    search_filter = None
-    if exact_terms:
-        must_conditions = [
-            models.FieldCondition(key="text", match=models.MatchText(text=term)) 
-            for term in exact_terms
-        ]
-        search_filter = models.Filter(must=must_conditions)
+client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
+client.set_model(DENSE_MODEL)
+client.set_sparse_model(SPARSE_MODEL)
 
-    # 3 Гибридный поиск (Dense + Sparse + RRF)
-    prefetches = [
-        models.Prefetch(query=dense_vec, using="dense", limit=fetch_limit, filter=search_filter),
-        models.Prefetch(query=query_sparse, using="sparse", limit=fetch_limit, filter=search_filter),
-    ]
-    
-    results = client.query_points(
-        collection_name=config.COLLECTION_NAME,
-        prefetch=prefetches,
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
+
+def ultimate_hybrid_search(query_text: str, fetch_limit: int = FETCH_LIMIT, final_limit: int = FINAL_LIMIT,
+                            dense_query_text: str = None):
+    results = client.query(
+        collection_name=COLLECTION_NAME,
+        query_text=query_text,
         limit=fetch_limit,
-        with_payload=True
-    ).points
-
-    # если с жестким фильтром ничего не нашли ищем без него
-    if not results and search_filter:
-        prefetches_fallback = [
-            models.Prefetch(query=dense_vec, using="dense", limit=fetch_limit),
-            models.Prefetch(query=query_sparse, using="sparse", limit=fetch_limit),
-        ]
-        results = client.query_points(
-            collection_name=config.COLLECTION_NAME,
-            prefetch=prefetches_fallback,
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=fetch_limit,
-            with_payload=True
-        ).points
-
+    )
     if not results:
-        return []
+        return {"results": [], "max_score": 0.0}
 
-    # 4 Реранкинг
-    pairs = [[query_text, chunk.payload['text']] for chunk in results]
+    from app.core.models import get_reranker
+    reranker = get_reranker()
+    pairs = [[query_text, r.document] for r in results]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(results, scores), key=lambda x: x[1], reverse=True)
+    top = ranked[:final_limit]
+    max_score = float(top[0][1]) if top else 0.0
+    return {"results": [r for r, s in top], "max_score": max_score}
+
+
+def multi_query_hybrid_search(queries: list, fetch_limit: int = FETCH_LIMIT, final_limit: int = FINAL_LIMIT,
+                               original_query: str = ""):
+    from concurrent.futures import ThreadPoolExecutor
+
+    rerank_query = original_query or queries[0]
+
+    def search_one(q):
+        return client.query(
+            collection_name=COLLECTION_NAME,
+            query_text=q,
+            limit=fetch_limit,
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        all_results = list(executor.map(search_one, queries))
+
+    # RRF merge
+    scores = {}
+    k = 60
+    for result_list in all_results:
+        for rank, r in enumerate(result_list):
+            rid = r.id
+            if rid not in scores:
+                scores[rid] = {"result": r, "score": 0}
+            scores[rid]["score"] += 1 / (k + rank + 1)
+
+    merged = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+    candidates = [x["result"] for x in merged]
+
+    from app.core.models import get_reranker
+    reranker = get_reranker()
+    pairs = [[rerank_query, r.document] for r in candidates]
     rerank_scores = reranker.predict(pairs)
-    
-    if hasattr(rerank_scores, 'tolist'):
-        rerank_scores = rerank_scores.tolist()
-    if not isinstance(rerank_scores, list):
-        rerank_scores = [rerank_scores]
-        
-    reranked_results = sorted(zip(rerank_scores, results), key=lambda x: x[0], reverse=True)
-    
-    top_results = []
-    for score, chunk in reranked_results[:final_limit]:
-        chunk.score = score
-        top_results.append(chunk)
-        
-    return top_results
+    ranked = sorted(zip(candidates, rerank_scores), key=lambda x: x[1], reverse=True)
+    top = ranked[:final_limit]
+    max_score = float(top[0][1]) if top else 0.0
+    return {"results": [r for r, s in top], "max_score": max_score}
