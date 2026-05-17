@@ -40,3 +40,13 @@ debug_router.log
 # Временные файлы
 *.tmp
 *.temp
+
+# Бинарники Qdrant
+qdrant.zip
+qdrant_bin/
+
+# Выводы тестов и оценки
+eval_output*.txt
+test_result.txt
+.qdrant-initialized
+data/
