@@ -1,0 +1,47 @@
+name: Deploy to SberCloud
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Copy files to server
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='*.gguf' \
+            --exclude='qdrant_storage/' \
+            --exclude='__pycache__/' \
+            --exclude='.env' \
+            --exclude='models/' \
+            ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:~/LLM_lawyer/
+
+      - name: Setup environment and start services
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            cd ~/LLM_lawyer
+
+            if [ ! -f .env ]; then
+              cp .env.example .env
+              sed -i "s/your_groq_api_key_here/${{ secrets.GROQ_API_KEY }}/" .env
+              sed -i "s/LLM_PROVIDER=.*/LLM_PROVIDER=groq/" .env
+              sed -i "s/QDRANT_HOST=.*/QDRANT_HOST=qdrant_db/" .env
+            fi
+
+            sudo docker compose up qdrant_db backend frontend -d --build
+            sudo docker compose ps
+          EOF
