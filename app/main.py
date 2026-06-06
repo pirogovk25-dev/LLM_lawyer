@@ -142,10 +142,14 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @app_api.post("/ask", response_model=FullResponse)
 async def ask_lawyer(request: QuestionRequest):
-    # Запускаем граф в потоке, чтобы не блокировать API
+    from services.langfuse_handler import get_langfuse_handler
+    langfuse_handler = get_langfuse_handler(session_id=request.question[:50])
+    callbacks = [langfuse_handler] if langfuse_handler else []
+
     final_state = await asyncio.to_thread(
-        app_workflow.invoke, 
-        {"question": request.question}
+        app_workflow.invoke,
+        {"question": request.question},
+        {"callbacks": callbacks}
     )
     
     return FullResponse(

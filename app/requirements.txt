@@ -19,3 +19,4 @@ langgraph
 
 python-docx
 tavily-python
+langfuse
